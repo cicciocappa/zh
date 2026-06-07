@@ -1,0 +1,15 @@
+# Build artifacts
+test_dump
+sandbox
+*.o
+
+# Headless test output
+frames/
+
+# Claude Code local metadata
+.claude/
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
