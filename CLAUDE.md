@@ -1,43 +1,59 @@
-# Horde fluid game — project memory
+# Horde game — project memory
 
-Progetto: gioco top-down 2D di zombie dove **l'orda è un fluido granulare simulato**
-(campo di densità su griglia), non una folla di agenti con pathfinding. Riferimento
-creativo: *Creeper World*. Stack: **C + SDL3** (il core sim è renderer-agnostico e
-porta su OpenGL/compute shader). Si lavora dal terminale per compilare e testare.
+Progetto: gioco top-down 2D di tower-defense dove **l'orda di zombie è una popolazione
+di particelle granulari persistenti** (tipo sabbia/SPH), non una folla di agenti con
+pathfinding individuale né — più — un campo di densità. Riferimento creativo:
+*"Sir, We Have an Orc Problem"* (TD 2D physics-based, ~100k nemici, corpi individuali
+che si accatastano come una massa che inonda la mappa). Stack: **C + SDL3** (il core sim
+è renderer-agnostico e pensato per portare su GPU/compute shader). Si lavora dal terminale.
 
 Conversazioni in **italiano**. Codice e commenti in inglese.
 
-## Stato attuale (POC verificato)
+> **Nota storica importante.** Il progetto è nato come "orda = fluido granulare" (campo di
+> densità `rho` su griglia, shallow-water). Quel modello è stato **ritirato** (commit
+> `149419f`/`822bdaf` se serve un confronto) perché derivare gli sprite dalla densità
+> istantanea li faceva apparire/sparire invece di seguire traiettorie. Vedi il pivot
+> all'Opzione B (particelle granulari) nella memoria di sessione. Il **grid-fluido non è
+> stato buttato**: è diventato l'infrastruttura (campo-obiettivo + spatial-hash + densità
+> derivata).
 
-Il core della simulazione e il sandbox SDL3 girano entrambi. Tutti i pezzi sono stati
-verificati a mano nel sandbox e via regression headless (200×200, 900 step → 
-`total_mass=116534.4 drained=171.6 bad_cells=0`, conservativo, niente NaN).
+## Stato attuale (verificato)
 
-Pezzi presenti, oltre al fluid core:
+Core a particelle e sandbox SDL3 girano entrambi. Verificato headless (200×200) — invarianti
+particellari OK: `in_wall=0 oob=0 nan=0`, nessuna fuga dai muri, niente NaN. Verificato a
+vista con `./sandbox shot` (flusso a fiume che si accumula e aggira un muro) e
+`./sandbox siege` (goal sigillato dai muri → l'orda assedia le pareti).
 
-- **Survival timer** (master switch `s->spawn_enabled`): il game layer disattiva tutti
-  gli spawner allo scadere di un countdown. Nel sandbox è il tasto `T` (OFF → 60s → 180s).
-- **Campo di velocità** (`vx, vy` collocated, additivo): impulse layer per esplosioni.
-  Advezione upwind con clamp CFL (`v_max=0.9`) e bounce semi-elastico sui muri; non
-  self-advect. Friction multiplicativa (`v_damp=0.95`). Goal forcing resta com'era
-  (non vogliamo inerzia "verso il goal" che rovini il curvare attorno ai muri).
-- **Esplosioni**: `sim_add_impulse(cx,cy,r,strength)` — carve radiale di `rho`
-  (fino a −90% al centro) + kick radiale di velocità. Nel sandbox tasto `E` o MMB.
-- **Particle view**: rendering alternativo nel sandbox (tasto `V`). Pool persistente
-  di 10k particelle; target per cella = `rho × 0.30` con soglia di visibilità
-  `rho ≥ 0.5`. Le particelle si muovono col campo `v` reale + bias verso `-∇phi`
-  + jitter, con bobbing 2-frame. *Solo placeholder visivo* (quadratini 3×3 rossi):
-  validato il flusso campo→sprite, asset veri da fare.
+Pezzi presenti:
+
+- **Orda = particelle** (SoA in `Sim`): nascono SOLO agli spawner, muoiono SOLO ai drain,
+  per il resto **conservate**. ~18-23k in flusso tipico; cap `pcap=200000`.
+- **Forza-obiettivo**: potential field `phi` (Dijkstra 8-vicini). I muri sono
+  **attraversabili a costo enorme** (`WALL_ENTER=5000`, ≫ qualunque giro sulla mappa): dove
+  c'è un varco vince il giro, dove il goal è sigillato il gradiente punta comunque verso di
+  esso → **assedio** (le particelle premono sui muri; con HP futuri li sfonderanno).
+- **Impaccamento granulare**: repulsione PBD a corto raggio (Jacobi double-buffer), niente
+  più pressione shallow-water. La velocità è ricavata dallo **spostamento reale**
+  (`pos_finale − pos_iniziale`) → contropressione, niente sovra-compressione.
+- **Campo di velocità** (`vx,vy`): layer di impulsi additivo per le esplosioni; le particelle
+  lo campionano. `sim_add_impulse(cx,cy,r,strength)` dà un kick radiale (tasto `E`/MMB).
+- **`rho` DERIVATA**: binning del conteggio particelle per cella. Serve al gameplay
+  (mira torrette, economia) e alla vista-campo di debug (`V`).
+- **Survival timer** (`s->spawn_enabled`): disattiva tutti gli spawner allo scadere
+  (sandbox: tasto `T`, OFF → 60s → 180s).
+- **Sprite zombie procedurale**: spritesheet 8×8 generato in codice (2 frame shuffle × 3
+  sfumature, una sola texture → draw batchati), 1 sprite per particella, depth-sort per y,
+  bobbing. *Ancora placeholder* (omino verde stilizzato), asset veri da fare in seguito.
 
 ## File
 
-- `sim.h` / `sim.c` — **core della simulazione**, C puro, zero dipendenze. È il pezzo
-  che porterà nel motore OpenGL (caricando `rho` come texture invece di disegnare con SDL).
-- `test_dump.c` — verifica headless (no SDL): scena → run → frame PPM in `frames/`.
-- `sandbox_sdl3.c` — sandbox interattivo SDL3 (pennelli muro/spawner/goal/drain, manopole
-  live, survival timer `T`, esplosioni `E`/MMB, particle view `V`).
+- `sim.h` / `sim.c` — **core della simulazione a particelle**, C puro, zero dipendenze. È il
+  pezzo che porterà su GPU (particelle + grid → entrambi compute-shader-friendly).
+- `test_dump.c` — verifica headless (no SDL): scena → run → invarianti + frame PPM in `frames/`
+  (la cartella `frames/` deve esistere, non è versionata).
+- `sandbox_sdl3.c` — sandbox interattivo SDL3 + modalità screenshot `shot`/`siege`.
 - `Makefile` — `make test` (no deps) · `make sandbox` (richiede SDL3) · `make`.
-- `README.md` — descrizione estesa del modello e dei controlli.
+- `README.md` — **probabilmente stale** (descriveva il vecchio modello fluido); da aggiornare.
 
 ## Build
 
@@ -46,74 +62,87 @@ make test      # headless, nessuna dipendenza
 make sandbox   # interattivo, richiede SDL3 (pkg-config --libs sdl3)
 ```
 
-Su questa macchina (Linux Mint 22.3 = Ubuntu noble) SDL3 NON è nei repo. È stato
-compilato dai sorgenti (libsdl-org/SDL, branch `release-3.2.x` → v3.2.31) e
-installato in `~/.local` senza sudo. Per ricompilare il sandbox:
+Su questa macchina (Linux Mint 22.3 = Ubuntu noble) SDL3 NON è nei repo. È stato compilato
+dai sorgenti (libsdl-org/SDL, **branch `release-3.2.x`** che riporta v3.2.31 — il tag
+`v3.2.31` NON esiste, l'ultimo tag rilasciato è `release-3.2.30`) e installato in `~/.local`
+senza sudo. Per ricompilare il sandbox:
 
 ```sh
 export PKG_CONFIG_PATH=$HOME/.local/lib/pkgconfig
 make sandbox
 ```
 
-L'rpath verso `~/.local/lib` è già incorporato nel binario, quindi `./sandbox`
-basta senza `LD_LIBRARY_PATH`. Sorgenti SDL3 in `~/src/SDL3`.
+L'rpath verso `~/.local/lib` è già nel binario, quindi `./sandbox` basta senza
+`LD_LIBRARY_PATH`. Sorgenti SDL3 in `~/src/SDL3`. Anteprime: `./sandbox shot` (o `siege`)
+salva un BMP, poi `convert shot.bmp shot.png`.
 
 ## Il modello (riferimento)
 
-L'orda è un campo di densità/profondità `rho` su griglia. Due forze:
+L'orda è una popolazione di particelle. Per ogni `sim_step`:
 
-1. **Goal forcing** — potential field `phi` (Dijkstra 8-vicini, costo-verso-obiettivo,
-   muri impassabili). La densità è avvettata lungo `-grad(phi)`: "gravità verso gli
-   obiettivi". Ricalcolato solo quando terreno/goal cambiano (`phi_dirty`).
-2. **Surface pressure** — equalizzazione shallow-water su `bed` (quota fondo; muri = bed
-   alto). L'orda preme contro i muri e, quando `bed+rho` supera la cima, sfiora oltre (weir).
+```
+phi (se dirty) → particles_spawn → particles_hash → particles_step
+                 → particles_drain → damp_velocity → particles_rasterize
+```
 
-Scelte deliberate: **niente momento, niente solve di incomprimibilità (Poisson)**. Il
-mezzo è comprimibile fino all'impaccamento (si impila) e la forma a rilassamento è
-incondizionatamente stabile (nessun vincolo CFL). È un cugino semplificato di Continuum
-Crowds (Treuille 2006) + shallow-water.
+- **`particles_spawn`** — ogni cella `CELL_SPAWN` emette `spawn_per_step` particelle/step
+  (accumulo frazionario), se `spawn_enabled`.
+- **`particles_hash`** — spatial hash sulle celle via counting sort (`cell_start`/`pidx`):
+  vicini in O(1). **Ricostruito a OGNI iterazione di collisione** (non una volta sola): senza,
+  i grani che si spingono escono dalle liste di vicini stantie e la densità non converge al
+  limite di packing → sovra-compressione. Costo O(N)×iters, trascurabile.
+- **`particles_step`** — il cuore granulare. Per ogni particella: (1) sterza lungo `-∇phi`
+  a una `p_goal_speed` di crociera, conservando momento (`p_friction`), + campo impulsi
+  (`vx,vy`) + jitter, clamp; (2) mossa tentativa, scivolando sull'asse bloccato dai muri;
+  (3) **resolve PBD**: repulsione a corto raggio (`p_radius`, `p_repel`, `p_collide_iters`
+  sweep Jacobi) che impacca/sparge e tiene tutti fuori dai muri. Velocità finale = spostamento
+  netto (contropressione).
+- **`particles_drain`** — una particella su cella `CELL_DRAIN` viene consumata a `drain_rate`
+  (swap-remove), accumula `drained_total`.
+- **`particles_rasterize`** — `rho[cella] += 1` per particella (densità derivata).
 
-**Manopola chiave:** `relax_iters` = dial granulare↔acquoso. Poche iterazioni → pile
-ripide / alto angolo di riposo (sabbioso); molte → auto-livellamento (acquoso).
+`goal_dir()` campiona `-∇phi`; **neutralizza i vicini-muro** (e `INF`) clampandoli al valore
+della cella, così la pendenza viene dai vicini liberi e non c'è una spinta spuria "scappa dal
+muro" (il flusso aperto resta corretto, l'assedio nasce dal pendio verso il goal).
 
-`sim_step()` = `apply_sources_drains` → `advect_toward_goal` → `advect_by_velocity`
-→ `damp_velocity` → `equalize_surface`.
+Scelte deliberate: **niente solve di incomprimibilità (Poisson)** — l'impaccamento è
+posizionale (PBD), comprimibile fino al packing, stabile. Cugino di un solver granulare
+position-based guidato da un campo-obiettivo condiviso (à la Continuum Crowds per il phi).
 
-I due step centrali (`advect_by_velocity` + `damp_velocity`) sono il layer di velocità
-descritto sopra: con `v=0` ovunque sono no-op, quindi il modello "puro" resta
-recuperabile semplicemente non iniettando impulsi.
+### Tunable principali (in `Sim`, regolabili a caldo nel sandbox)
+
+- `p_goal_speed` (crociera, tasti `-`/`=`) · `spawn_per_step` (`,`/`.`) ·
+  `p_repel` (impaccamento/larghezza onda, `;`/`'`) · `p_friction` (sloshy↔assestato, `9`/`0`).
+- `p_radius`, `p_collide_iters`, `p_jitter`: default ragionevoli in `sim_create`, da tarare in
+  codice. **Attenzione**: tenere `2·p_radius ≤ 1` e velocità `< 1` cella/step, altrimenti i
+  vicini escono dal blocco 3×3 dell'hash (`PMAX=0.85` in `particles_step`).
 
 ## Convenzioni
 
-- Buffer per-cella `s->d` per i delta → aggiornamenti conservativi e order-independent.
-- Indicizzazione `i = y*W + x`; bordo sigillato con `bed` enorme.
-- Tutto data-parallel per-cella → pensare già "compute-shader-friendly" (no dipendenze
-  seriali tra celle dentro uno sweep; usare Jacobi/double-buffer, non Gauss-Seidel in-place).
-- Mantenere il core SIM senza alcuna dipendenza da SDL/OpenGL.
+- Indicizzazione `i = y*W + x`; bordo sigillato con `bed` enorme (i muri sono `bed>0`).
+- Tutto pensato **data-parallel / compute-shader-friendly**: hash via counting sort, collisioni
+  Jacobi **double-buffered** (`px`↔`px2`, mai Gauss-Seidel in-place), nessuna dipendenza
+  seriale tra particelle dentro uno sweep.
+- Il core SIM resta **senza alcuna dipendenza da SDL/OpenGL**. Il sandbox è solo rendering:
+  legge `s->px/s->py/s->pseed` e disegna; per il depth-sort copia in un buffer locale.
 
 ## Decisioni aperte / agenda
 
-Cose fatte: **campo di velocità ✓** (additivo, no self-advect, no sloshing nativo —
-si può aggiungere generando velocità dall'equalize_surface se servirà);
-**particle view ✓** ma come placeholder (vedi sotto, va completata).
+Fatto: **pivot a particelle granulari persistenti ✓** (conservazione, traiettorie continue,
+assedio dei muri, contropressione). **Sprite procedurale ✓** ma placeholder.
 
-Prossimi candidati naturali:
+Prossimi candidati:
 
-1. **Sprite veri al posto dei quadratini.** Il flusso campo→sprite è validato; manca:
-   (a) procurare/disegnare uno spritesheet zombie top-down (walk cycle, magari 4 direzioni
-   o solo bobbing top-down); (b) sostituire `SDL_RenderFillRects` con `SDL_RenderTexture`
-   per ogni sprite, eventualmente con orientamento dedotto da `-∇phi`; (c) se il count
-   supera ~10-20k pensare al backend `SDL_GPU` con instancing. Decisione presa nel POC:
-   visualizziamo *tutta* l'orda come sprite (non solo la frontiera), `sprites_per_unit=0.3`.
-2. **Primo elemento di gameplay — torrette.** I drain già consumano massa e contano
-   `drained_total`; il passo successivo è renderli "attivi": una torretta è un drain
-   che spara in base al `rho` adiacente, ha HP, costa biomassa accumulata. Definire il
-   ciclo economia (mass drained → currency → build).
-3. **Muri costruibili / scavabili** dal player (bed = altezza/HP). API già pronta
-   (`sim_set_wall`), manca solo il layer di UI e bilanciamento.
+1. **Scaling a 100k → port GPU/compute.** Su CPU si valida a ~20-50k; per i 100k del
+   riferimento serve spostare hash + collide + integrazione su compute shader (la pipeline è
+   già scelta apposta GPU-friendly).
+2. **Torrette (primo gameplay).** I drain già consumano particelle e contano `drained_total`;
+   renderli "attivi": una torretta è un drain che spara in base alle particelle/`rho` adiacenti,
+   ha HP, costa biomassa. Definire l'economia (drained → currency → build).
+3. **Muri con HP, costruibili/scavabili.** `sim_set_wall` c'è (bed = altezza/HP); l'assedio già
+   preme contro i muri — manca far cedere il muro sotto pressione + UI/bilanciamento.
+4. **Asset sprite veri** al posto dell'omino verde (eventuale orientamento da `-∇phi`,
+   cadaveri/sangue persistenti come nel riferimento).
 
-Game layer più futuri (predisposti nel data model): muri con HP che cedono;
-fuoco = campo `temperature` + propagazione cellulare; attrattori per rumore/luce
-(fase offensiva/stealth). Sloshing autentico (equalize_surface che genera `v` invece
-di muovere `rho` direttamente) è il "upgrade fisico" più grande ancora da fare —
-costoso in CFL ma il look sarebbe spettacolare.
+Più avanti (predisposti): fuoco = campo `temperature` + propagazione; attrattori per
+rumore/luce (fase offensiva/stealth).

@@ -16,16 +16,20 @@
  *     3              brush = GOAL
  *     4              brush = DRAIN
  *     [ / ]          brush size down / up
- *     - / =          fewer / more equalization iters (granular <-> watery)
- *     , / .          flow rate down / up
+ *     - / =          horde cruise speed down / up        (p_goal_speed)
+ *     , / .          spawn rate down / up                (spawn_per_step)
+ *     Z / X          repulsion / packing down / up        (p_repel)
+ *     O / P          collision radius down / up            (p_radius)
+ *     9 / 0          friction down / up (sloshy<->settled)(p_friction)
+ *     K / L          jam freezing down / up (dense piles lock)(p_jam_damp)
  *     SPACE          pause / resume
  *     N              single step (while paused)
- *     C              clear density (keep terrain)
+ *     C              clear the horde (keep terrain)
  *     R              reset everything
  *     T              cycle survival timer (OFF -> 60s -> 180s -> OFF);
- *                    when it expires, all spawners stop injecting.
- *     E / MMB        explosion at cursor (radial impulse + density carve)
- *     V              toggle render: density field <-> particle sprites
+ *                    when it expires, all spawners stop emitting.
+ *     E / MMB        explosion at cursor (radial velocity impulse)
+ *     V              toggle render: zombie sprites <-> derived-density field
  *     ESC            quit
  */
 #include "sim.h"
@@ -43,22 +47,10 @@
 #define BOOM_RADIUS   16
 #define BOOM_STRENGTH 0.90f
 
-/* Particle view: persistent pool. Each cell has target = rho * SPRITES_PER_UNIT,
- * particles are spawned/killed to track it. Movement = field v + small phi
- * descent + jitter. Two-frame bobbing for life. Field is the truth; sprites
- * are just a view. */
-#define MAX_PARTICLES    10000
-#define SPRITES_PER_UNIT 0.30f
-#define RHO_VISIBLE_MIN  0.5f
-#define PHI_BIAS         0.12f
-#define JITTER_AMP       0.05f
-
-typedef struct { float x, y; unsigned char phase; } Particle;
-static Particle parts[MAX_PARTICLES];
-static int      n_alive = 0;
-static int      cell_counts[GW*GH];
-
-static float frand(void) { return (float)rand() / (float)RAND_MAX; }
+/* The horde is now the sim's PERSISTENT particle population (sim.c owns it):
+ * one sprite per live particle, read straight from s->px/s->py/s->pseed. The
+ * old density-tracking marker pool is gone — particles are born at spawners,
+ * die at drains, and never pop in/out to chase a density field. */
 
 enum { B_WALL, B_SPAWN, B_GOAL, B_DRAIN };
 static const float WALL_H = 9.0f;
@@ -94,95 +86,94 @@ static void render(Sim *s, Uint32 *px, int show_rho) {
     }
 }
 
-static void particles_update(Sim *s) {
-    memset(cell_counts, 0, sizeof cell_counts);
+/* Procedural stylized zombie sprite: an 8x8 top-down humanoid (head, splayed
+ * arms, legs), generated in code so we depend on nothing but core SDL3 (no
+ * SDL_image). The sheet is a grid of SPR_FRAMES (shuffle cycle) x SPR_SHADES
+ * (tonal variants): picking a shade per particle breaks the "rubber-stamp" look
+ * so a dense field reads as many individuals — all from one texture, so the
+ * draws still batch. Placeholder art; swap for loaded art later. */
+#define SPR_W      8
+#define SPR_H      8
+#define SPR_FRAMES 2
+#define SPR_SHADES 3
+#define SPR_COLS   (SPR_FRAMES * SPR_SHADES)
+#define SHEET_W    (SPR_W * SPR_COLS)
 
-    /* 1) advance alive particles; drop OOB / wall-hits; tally by cell. */
-    for (int p = 0; p < n_alive; ) {
-        Particle *pt = &parts[p];
-        int cx = (int)pt->x, cy = (int)pt->y;
-        if (cx < 1 || cy < 1 || cx >= GW-1 || cy >= GH-1 ||
-            s->bed[cy*GW + cx] > 0.0f) {
-            parts[p] = parts[--n_alive]; continue;
-        }
-        int ci = cy*GW + cx;
-        float vx = s->vx[ci], vy = s->vy[ci];
-        float pc = s->phi[ci];
-        if (pc < SIM_INF) {
-            float pl = s->phi[ci-1],  pr = s->phi[ci+1];
-            float pu = s->phi[ci-GW], pd = s->phi[ci+GW];
-            if (pl >= SIM_INF) pl = pc;
-            if (pr >= SIM_INF) pr = pc;
-            if (pu >= SIM_INF) pu = pc;
-            if (pd >= SIM_INF) pd = pc;
-            float gx = pl - pr, gy = pu - pd;
-            float mag = fabsf(gx) + fabsf(gy);
-            if (mag > 1e-6f) {
-                float k = PHI_BIAS / mag;
-                vx += gx * k; vy += gy * k;
-            }
-        }
-        vx += (frand() - 0.5f) * JITTER_AMP;
-        vy += (frand() - 0.5f) * JITTER_AMP;
-        float nx = pt->x + vx, ny = pt->y + vy;
-        int ncx = (int)nx, ncy = (int)ny;
-        if (ncx < 1 || ncy < 1 || ncx >= GW-1 || ncy >= GH-1 ||
-            s->bed[ncy*GW + ncx] > 0.0f) {
-            /* stay put rather than tunneling into a wall */
-            nx = (float)cx + 0.5f; ny = (float)cy + 0.5f;
-            ncx = cx; ncy = cy;
-        }
-        pt->x = nx; pt->y = ny;
-        cell_counts[ncy*GW + ncx]++;
-        p++;
+static Uint32 spr_palette(char c, float k) {   /* k = per-shade brightness */
+    int r, g, b;
+    switch (c) {
+        case 'K': r = 0x32; g = 0x52; b = 0x1E; break;   /* outline: DARK GREEN, not black
+                                                            (near-black blackens dense piles) */
+        case 'G': r = 0x5C; g = 0x8A; b = 0x38; break;   /* rotting-green body */
+        case 'H': r = 0xA8; g = 0xCC; b = 0x68; break;   /* sickly pale head   */
+        default:  return 0x00000000u;                    /* transparent        */
     }
-
-    /* 2) cull cells whose population exceeds the target. */
-    for (int p = 0; p < n_alive; ) {
-        int cx = (int)parts[p].x, cy = (int)parts[p].y;
-        int ci = cy*GW + cx;
-        int target = (s->rho[ci] < RHO_VISIBLE_MIN)
-                     ? 0
-                     : (int)(s->rho[ci] * SPRITES_PER_UNIT);
-        if (cell_counts[ci] > target) {
-            cell_counts[ci]--;
-            parts[p] = parts[--n_alive];
-            continue;
-        }
-        p++;
-    }
-
-    /* 3) spawn into cells below target. */
-    for (int y = 1; y < GH-1; y++)
-    for (int x = 1; x < GW-1; x++) {
-        int i = y*GW + x;
-        if (s->bed[i] > 0.0f) continue;
-        if (s->rho[i] < RHO_VISIBLE_MIN) continue;
-        int target = (int)(s->rho[i] * SPRITES_PER_UNIT);
-        while (cell_counts[i] < target && n_alive < MAX_PARTICLES) {
-            Particle *pt = &parts[n_alive++];
-            pt->x = (float)x + frand();
-            pt->y = (float)y + frand();
-            pt->phase = (unsigned char)(rand() & 0xff);
-            cell_counts[i]++;
-        }
-    }
+    r = (int)(r * k); g = (int)(g * k); b = (int)(b * k);
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
+    return 0xFF000000u | (r << 16) | (g << 8) | b;
 }
 
-static void particles_render(SDL_Renderer *ren, int tick) {
-    static SDL_FRect rects[MAX_PARTICLES];
-    int n = n_alive;
-    for (int p = 0; p < n; p++) {
-        const Particle *pt = &parts[p];
-        int frame = ((tick + pt->phase) >> 3) & 1;          /* swap every 8 ticks */
-        float bob = frame ? 0.0f : -1.0f;
-        rects[p].x = pt->x * (float)CELL - 1.5f;
-        rects[p].y = pt->y * (float)CELL - 1.5f + bob;
-        rects[p].w = 3.0f;
-        rects[p].h = 3.0f;
+/* Build the SHEET_W x SPR_H spritesheet as a STATIC texture. Column index is
+ * shade*SPR_FRAMES + frame, so src.x = col*SPR_W picks one sub-image. */
+static SDL_Texture *make_zombie_tex(SDL_Renderer *ren) {
+    static const char *frames[SPR_FRAMES][SPR_H] = {
+        {   /* frame 0: legs together, arms wide */
+            "..KKKK..", ".KHHHHK.", ".KHHHHK.", "KKGGGGKK",
+            ".KGGGGK.", ".KGGGGK.", ".KG..GK.", ".K....K.",
+        },
+        {   /* frame 1: arms tucked, feet shifted */
+            "..KKKK..", ".KHHHHK.", ".KHHHHK.", ".KGGGGK.",
+            "KKGGGGKK", ".KGGGGK.", ".KG..GK.", "..K..K..",
+        },
+    };
+    static const float shade_k[SPR_SHADES] = { 0.85f, 1.0f, 1.15f };
+    static Uint32 buf[SPR_H * SHEET_W];
+    for (int sh = 0; sh < SPR_SHADES; sh++)
+    for (int fr = 0; fr < SPR_FRAMES; fr++) {
+        int colx = (sh * SPR_FRAMES + fr) * SPR_W;
+        for (int y = 0; y < SPR_H; y++)
+        for (int x = 0; x < SPR_W; x++)
+            buf[y*SHEET_W + colx + x] = spr_palette(frames[fr][y][x], shade_k[sh]);
     }
-    SDL_SetRenderDrawColor(ren, 210, 60, 60, 255);
-    SDL_RenderFillRects(ren, rects, n);
+    SDL_Texture *t = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                                       SDL_TEXTUREACCESS_STATIC, SHEET_W, SPR_H);
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    SDL_SetTextureScaleMode(t, SDL_SCALEMODE_NEAREST);
+    SDL_UpdateTexture(t, NULL, buf, SHEET_W*(int)sizeof(Uint32));
+    return t;
+}
+
+/* A render-only copy of a particle (so we can depth-sort without touching the
+ * core's SoA arrays). */
+#define RENDER_CAP 200000
+typedef struct { float x, y; unsigned char seed; } RSprite;
+
+static int cmp_rsprite_y(const void *a, const void *b) {
+    float ya = ((const RSprite*)a)->y, yb = ((const RSprite*)b)->y;
+    return (ya > yb) - (ya < yb);
+}
+
+static void particles_render(SDL_Renderer *ren, SDL_Texture *zt, Sim *s, int tick) {
+    static RSprite buf[RENDER_CAP];
+    int n = s->pcount < RENDER_CAP ? s->pcount : RENDER_CAP;
+    for (int p = 0; p < n; p++) {
+        buf[p].x = s->px[p]; buf[p].y = s->py[p]; buf[p].seed = s->pseed[p];
+    }
+    /* draw back-to-front so lower (nearer) zombies occlude those behind them */
+    qsort(buf, n, sizeof(RSprite), cmp_rsprite_y);
+    for (int p = 0; p < n; p++) {
+        int frame = ((tick + buf[p].seed) >> 3) & 1;        /* swap every 8 ticks */
+        int shade = buf[p].seed % SPR_SHADES;               /* stable per particle */
+        float bob = frame ? 0.0f : -1.0f;
+        SDL_FRect src = { (float)((shade * SPR_FRAMES + frame) * SPR_W),
+                          0.0f, SPR_W, SPR_H };
+        SDL_FRect dst = { buf[p].x * (float)CELL - SPR_W * 0.5f,
+                          buf[p].y * (float)CELL - SPR_H * 0.5f + bob,
+                          SPR_W, SPR_H };
+        SDL_RenderTexture(ren, zt, &src, &dst);
+    }
 }
 
 static void paint(Sim *s, int cx, int cy, int brush, int size, int erase) {
@@ -205,20 +196,74 @@ static void paint(Sim *s, int cx, int cy, int brush, int size, int erase) {
     }
 }
 
-int main(void) {
+/* Headless-ish preview: seed a scene, run the sim in particle view, dump one
+ * frame to shot.bmp. Reuses the real render path so it shows exactly what the
+ * interactive view does. Invoke as `./sandbox shot`. */
+static void run_shot(SDL_Renderer *ren, SDL_Texture *tex, SDL_Texture *ztex, Sim *s,
+                     int siege, const char *outfile) {
+    if (!siege) {
+        /* spawner top-left, goal bottom-right, a wall bar so the horde has to
+         * stream around it — exercises the flowing front, not just a pile. */
+        paint(s, 55, 45, B_SPAWN, 9, 0);
+        paint(s, 165, 175, B_GOAL, 7, 0);
+        for (int y = 25; y <= 150; y++) {
+            sim_set_wall(s, 110, y, WALL_H);
+            sim_set_wall(s, 111, y, WALL_H);
+        }
+    } else {
+        /* goal sealed inside a wall box; spawner outside. The horde must be
+         * drawn to SIEGE the walls instead of ignoring the unreachable goal. */
+        paint(s, 110, 30, B_SPAWN, 10, 0);
+        paint(s, 110, 150, B_GOAL, 6, 0);
+        int x0 = 90, x1 = 130, y0 = 130, y1 = 170;
+        for (int x = x0; x <= x1; x++) { sim_set_wall(s, x, y0, WALL_H); sim_set_wall(s, x, y1, WALL_H); }
+        for (int y = y0; y <= y1; y++) { sim_set_wall(s, x0, y, WALL_H); sim_set_wall(s, x1, y, WALL_H); }
+    }
+    s->spawn_enabled = 1;
+    for (int i = 0; i < 1200; i++) sim_step(s);
+
+    static Uint32 px[GW*GH];
+    render(s, px, 0);
+    SDL_UpdateTexture(tex, NULL, px, GW * sizeof(Uint32));
+    SDL_RenderClear(ren);
+    SDL_RenderTexture(ren, tex, NULL, NULL);
+    particles_render(ren, ztex, s, 4);
+
+    SDL_Surface *surf = SDL_RenderReadPixels(ren, NULL);  /* read before present */
+    if (surf) {
+        if (!SDL_SaveBMP(surf, outfile)) SDL_Log("SaveBMP: %s", SDL_GetError());
+        else SDL_Log("wrote %s  (%d particles alive)", outfile, s->pcount);
+        SDL_DestroySurface(surf);
+    } else {
+        SDL_Log("ReadPixels: %s", SDL_GetError());
+    }
+    SDL_RenderPresent(ren);
+}
+
+int main(int argc, char **argv) {
     if (!SDL_Init(SDL_INIT_VIDEO)) { SDL_Log("init: %s", SDL_GetError()); return 1; }
     SDL_Window   *win = SDL_CreateWindow("Horde fluid sandbox", WINW, WINH, 0);
     SDL_Renderer *ren = SDL_CreateRenderer(win, NULL);
     SDL_Texture  *tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
                                           SDL_TEXTUREACCESS_STREAMING, GW, GH);
     SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
+    SDL_Texture  *ztex = make_zombie_tex(ren);
 
     Sim *s = sim_create(GW, GH);
     static Uint32 px[GW*GH];
 
+    if (argc > 1 && (SDL_strcmp(argv[1], "shot") == 0 || SDL_strcmp(argv[1], "siege") == 0)) {
+        int siege = SDL_strcmp(argv[1], "siege") == 0;
+        run_shot(ren, tex, ztex, s, siege, siege ? "siege.bmp" : "shot.bmp");
+        sim_free(s);
+        SDL_DestroyTexture(ztex); SDL_DestroyTexture(tex);
+        SDL_DestroyRenderer(ren); SDL_DestroyWindow(win); SDL_Quit();
+        return 0;
+    }
+
     int brush = B_WALL, size = 3, paused = 0, running = 1;
     int painting = 0, erasing = 0;
-    int render_mode = 0;        /* 0 = density field, 1 = particle sprites */
+    int render_mode = 1;        /* 0 = derived-density field, 1 = zombie sprites */
     int tick = 0;               /* frame counter for sprite animation       */
 
     /* survival timer (wall-clock, frozen while paused). -1 = disabled. */
@@ -268,10 +313,10 @@ int main(void) {
                 case SDLK_4: brush = B_DRAIN; break;
                 case SDLK_LEFTBRACKET:  if (size > 0) size--; break;
                 case SDLK_RIGHTBRACKET: if (size < 20) size++; break;
-                case SDLK_MINUS:  if (s->relax_iters > 1) s->relax_iters--; break;
-                case SDLK_EQUALS: if (s->relax_iters < 30) s->relax_iters++; break;
-                case SDLK_COMMA:  s->flow = fmaxf(0.02f, s->flow - 0.02f); break;
-                case SDLK_PERIOD: s->flow = fminf(0.25f, s->flow + 0.02f); break;
+                case SDLK_MINUS:  s->p_goal_speed = fmaxf(0.02f, s->p_goal_speed - 0.02f); break;
+                case SDLK_EQUALS: s->p_goal_speed = fminf(0.80f, s->p_goal_speed + 0.02f); break;
+                case SDLK_COMMA:  s->spawn_per_step = fmaxf(0.00f, s->spawn_per_step - 0.01f); break;
+                case SDLK_PERIOD: s->spawn_per_step = fminf(1.00f, s->spawn_per_step + 0.01f); break;
                 case SDLK_SPACE: paused = !paused; break;
                 case SDLK_N: if (paused) sim_step(s); break;
                 case SDLK_C: sim_clear(s); break;
@@ -293,6 +338,14 @@ int main(void) {
                     break;
                 }
                 case SDLK_V: render_mode = !render_mode; break;
+                case SDLK_Z:  s->p_repel = fmaxf(0.05f, s->p_repel - 0.05f); break;
+                case SDLK_X: s->p_repel = fminf(1.00f, s->p_repel + 0.05f); break;
+                case SDLK_9: s->p_friction = fmaxf(0.00f, s->p_friction - 0.05f); break;
+                case SDLK_0: s->p_friction = fminf(0.95f, s->p_friction + 0.05f); break;
+                case SDLK_O: s->p_radius = fmaxf(0.20f, s->p_radius - 0.05f); break;
+                case SDLK_P: s->p_radius = fminf(2.50f, s->p_radius + 0.05f); break;
+                case SDLK_K: s->p_jam_damp = fmaxf(0.00f, s->p_jam_damp - 0.05f); break;
+                case SDLK_L: s->p_jam_damp = fminf(0.98f, s->p_jam_damp + 0.05f); break;
                 default: break;
                 }
                 break;
@@ -302,13 +355,11 @@ int main(void) {
 
         if (!paused) { sim_step(s); tick++; }
 
-        if (render_mode == 1 && !paused) particles_update(s);
-
         render(s, px, render_mode == 0);
         SDL_UpdateTexture(tex, NULL, px, GW * sizeof(Uint32));
         SDL_RenderClear(ren);
         SDL_RenderTexture(ren, tex, NULL, NULL);
-        if (render_mode == 1) particles_render(ren, tick);
+        if (render_mode == 1) particles_render(ren, ztex, s, tick);
         SDL_RenderPresent(ren);
 
         char timer_str[40];
@@ -319,20 +370,22 @@ int main(void) {
             snprintf(timer_str, sizeof timer_str, "timer:%d:%02d%s",
                      secs/60, secs%60, s->spawn_enabled ? "" : " SPAWN-OFF");
         }
-        char view_str[40];
-        if (render_mode) snprintf(view_str, sizeof view_str, "PARTICLES(%d/%d)", n_alive, MAX_PARTICLES);
-        else             snprintf(view_str, sizeof view_str, "FIELD");
+        char view_str[32];
+        snprintf(view_str, sizeof view_str, render_mode ? "ZOMBIES" : "FIELD");
         char title[256];
         snprintf(title, sizeof title,
-                 "Horde fluid  |  brush:%s size:%d  flow:%.2f  relax_iters:%d  %s  %s  view:%s  drained:%.0f",
+                 "Horde  |  brush:%s size:%d  speed:%.2f spawn:%.2f repel:%.2f frict:%.2f rad:%.2f jam:%.2f  "
+                 "%s  %s  view:%s  pop:%d/%d  drained:%.0f",
                  (const char*[]){"WALL","SPAWN","GOAL","DRAIN"}[brush], size,
-                 s->flow, s->relax_iters, paused ? "PAUSED" : "running", timer_str,
-                 view_str, s->drained_total);
+                 s->p_goal_speed, s->spawn_per_step, s->p_repel, s->p_friction, s->p_radius, s->p_jam_damp,
+                 paused ? "PAUSED" : "running", timer_str,
+                 view_str, s->pcount, s->spawn_max, s->drained_total);
         SDL_SetWindowTitle(win, title);
         SDL_Delay(8);
     }
 
     sim_free(s);
+    SDL_DestroyTexture(ztex);
     SDL_DestroyTexture(tex);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);

@@ -6,6 +6,12 @@ sandbox
 # Headless test output
 frames/
 
+# Screenshot/preview artifacts (./sandbox shot|siege)
+shot.bmp
+shot.png
+siege.bmp
+siege.png
+
 # Claude Code local metadata
 .claude/
 

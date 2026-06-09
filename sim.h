@@ -66,6 +66,42 @@ typedef struct {
     /* bookkeeping */
     int   phi_dirty;   /* set when bed/goals change -> recompute phi       */
     double drained_total; /* cumulative removed mass (future: biomass/score)*/
+
+    /* -------------------------------------------------------------------- *
+     * PARTICLE HORDE — the authoritative agents (granular, persistent).
+     * The grid above is now infrastructure: phi = shared goal force,
+     * cells = spatial hash, rho = density DERIVED from particle binning.
+     * Particles are born only at spawners, die only at drains; otherwise
+     * conserved. Packing/angle-of-repose comes from short-range repulsion,
+     * not from surface equalization.  SoA layout, GPU-port-friendly.        */
+    int    pcount, pcap;          /* live count / allocated capacity         */
+    float *px,  *py;              /* positions (grid coords, float)          */
+    float *pvx, *pvy;             /* velocities (cells/step)                 */
+    float *px2, *py2;             /* double buffer for Jacobi collision pass */
+    float *psx, *psy;             /* start-of-step positions (PBD velocity)  */
+    unsigned char *pseed;         /* per-particle random byte (sprite/jitter)*/
+
+    /* spatial hash over cells (counting sort, rebuilt each step) */
+    int   *cell_start;            /* size n+1: prefix offsets into pidx      */
+    int   *cell_count;            /* size n:   transient per-cell tally      */
+    int   *pidx;                  /* size pcap: particle indices, cell-sorted*/
+
+    /* particle tunables */
+    float p_radius;     /* interaction/packing radius (grid units)          */
+    float p_repel;      /* repulsion stiffness (fraction of overlap pushed) */
+    int   p_collide_iters; /* Jacobi resolve sweeps per step                */
+    float p_goal_speed; /* target cruise speed down -grad(phi)              */
+    float p_friction;   /* velocity retention per step (granular damping)   */
+    float p_jitter;     /* small random walk amplitude                      */
+    float spawn_per_step; /* particles emitted per spawner cell per step    */
+    float spawn_accum;  /* fractional spawn carryover                       */
+    int   spawn_max;    /* stop spawning once pcount reaches this. With no
+                           sink the horde would otherwise grow forever and a
+                           pile never settles; this caps it.                 */
+    float p_press_k;    /* grid-pressure strength: push down -grad(excess)  */
+    float p_rho_target; /* density (particles/cell) above which pressure acts*/
+    float p_jam_damp;   /* density-driven freezing: 0=off, ~1=dense piles lock
+                           up (high static friction) instead of trembling     */
 } Sim;
 
 Sim *sim_create(int W, int H);
@@ -85,6 +121,10 @@ void sim_add_impulse (Sim *s, int cx, int cy, int radius, float strength);
 
 /* Recompute the potential field (Dijkstra, 8-neighbourhood, walls blocked). */
 void sim_recompute_phi(Sim *s);
+
+/* Manually emit n particles inside cell (x,y) (jittered). Used by tools/tests;
+ * the normal source of births is spawners during sim_step. Returns # emitted. */
+int  sim_emit(Sim *s, int x, int y, int n);
 
 /* Advance one simulation step. */
 void sim_step(Sim *s);
